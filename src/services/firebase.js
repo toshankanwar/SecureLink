@@ -41,34 +41,29 @@ class FirebaseService {
   }
 
   async createUserProfile(user, contactId, photoURL = null) {
-    try {
-      const profileData = {
-        uid: user.uid,
-        contactId: contactId,
-        displayName: user.displayName || '',
-        email: user.email || '',
-        photoURL: photoURL || this.getCloudinaryPhotoUrl(contactId),
-        createdAt: firestore.FieldValue.serverTimestamp(),
-        lastSeen: firestore.FieldValue.serverTimestamp(),
-        isOnline: true,
-        deviceInfo: {
-          lastDevice: 'mobile',
-          appVersion: '1.0.0',
-        },
-        settings: {
-          profilePhotoVisible: true,
-          lastSeenVisible: true,
-          onlineStatusVisible: true,
-        }
-      };
-      await firestore().collection('users').doc(user.uid).set(profileData);
-      return profileData;
-    } catch (error) {
-      console.error('Error creating user profile:', error);
-      throw error;
-    }
+    // 'user' here must only have simple fields
+    const profileData = {
+      uid: user.uid,
+      contactId: contactId,
+      displayName: user.displayName || '',
+      email: user.email || '',
+      photoURL: photoURL || this.getCloudinaryPhotoUrl(contactId),
+      createdAt: firestore.FieldValue.serverTimestamp(),
+      lastSeen: firestore.FieldValue.serverTimestamp(),
+      isOnline: true,
+      deviceInfo: {
+        lastDevice: 'mobile',
+        appVersion: '1.0.0',
+      },
+      settings: {
+        profilePhotoVisible: true,
+        lastSeenVisible: true,
+        onlineStatusVisible: true,
+      }
+    };
+    await firestore().collection('users').doc(user.uid).set(profileData);
+    return profileData;
   }
-
   getCloudinaryPhotoUrl(contactId, transformation = 'w_400,h_400,c_fill,f_auto,q_auto') {
     return `https://res.cloudinary.com/drlxxyu9o/image/upload/${transformation}/securelink/profile_pictures/profile_${contactId}.jpg`;
   }
@@ -125,21 +120,36 @@ class FirebaseService {
   async signUpWithEmail(email, password, displayName) {
     try {
       const userCredential = await auth().createUserWithEmailAndPassword(email, password);
-      await userCredential.user.updateProfile({ displayName: displayName });
+  
+      await userCredential.user.updateProfile({ displayName });
+  
+      await auth().currentUser.reload();
+      const updatedUser = auth().currentUser;
+  
       const contactId = await this.generateUniqueContactId();
-      const profileData = await this.createUserProfile(userCredential.user, contactId);
+  
+      // IMPORTANT: Only pass the needed simple fields, never the raw user
+      const userForProfile = {
+        uid: updatedUser.uid,
+        displayName,
+        email: updatedUser.email,
+        photoURL: updatedUser.photoURL || this.getCloudinaryPhotoUrl(contactId),
+      };
+  
+      const profileData = await this.createUserProfile(userForProfile, contactId);
+  
       await userCredential.user.sendEmailVerification();
+  
       return {
-        user: userCredential.user,
-        contactId: contactId,
-        profileData: profileData,
+        user: updatedUser,
+        contactId,
+        profileData,
         needsEmailVerification: true,
       };
     } catch (error) {
       throw this.handleFirebaseError(error);
     }
   }
-
   async signInWithEmail(email, password) {
     try {
       const userCredential = await auth().signInWithEmailAndPassword(email, password);

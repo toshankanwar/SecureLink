@@ -1,103 +1,178 @@
+// src/hooks/useChat.js
 import { useState, useEffect, useCallback } from 'react';
-import { useAuth } from '../context/AuthContext'; // <-- ALWAYS import from context/AuthContext
-import { useWebSocket } from './useWebSocket';
+import { useAuth } from '../context/AuthContext';
 import ApiService from '../services/api';
-import EncryptionService from '../services/encryption';
+import StorageService from '../services/storage';
+import { generateUniqueId } from '../utils/helpers';
 
 export function useChat(contactId) {
   const { user } = useAuth();
-  const { sendMessage: wsSendMessage, messages: wsMessages } = useWebSocket();
-
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [chatId, setChatId] = useState(null);
 
   useEffect(() => {
-    if (contactId) {
-      initializeChat();
+    if (user && contactId) {
+      loadMessages();
+      // Poll for new messages every 5 seconds
+      const interval = setInterval(pollMessages, 5000);
+      return () => clearInterval(interval);
     }
-  }, [contactId]);
+  }, [user, contactId]);
 
-  useEffect(() => {
-    // Handle incoming WebSocket messages
-    wsMessages.forEach(message => {
-      if (message.type === 'new_message' && message.sender_id !== user.id) {
-        addMessage(message);
-      }
-    });
-  }, [wsMessages, user?.id]);
-
-  const initializeChat = async () => {
+  const loadMessages = async () => {
     try {
-      setLoading(true);
+      // Load local messages first
+      const localMessages = await getLocalMessages(contactId);
+      setMessages(localMessages);
+      setLoading(false);
 
-      // Get or create chat
-      const chatResponse = await ApiService.createChat(contactId);
-      setChatId(chatResponse.chat_id);
-
-      // Load chat history
-      const historyResponse = await ApiService.getChatHistory(chatResponse.chat_id);
-      setMessages(historyResponse.messages || []);
-
-    } catch (err) {
-      setError(err.message);
-    } finally {
+      // Then fetch from server
+      await pollMessages();
+    } catch (error) {
+      console.error('Error loading messages:', error);
+      setError(error.message);
       setLoading(false);
     }
   };
 
-  const sendMessage = useCallback(async (messageText) => {
+  const pollMessages = async () => {
     try {
-      const messageId = EncryptionService.generateMessageId();
-      const timestamp = Date.now();
+      const response = await ApiService.getMessages(50);
+      const serverMessages = response.messages || [];
 
-      // Create message object
-      const message = {
-        id: messageId,
-        content: messageText,
-        sender_id: user.id,
-        recipient_id: contactId,
-        timestamp,
+      if (serverMessages.length > 0) {
+        // Save server messages locally
+        for (const message of serverMessages) {
+          await saveLocalMessage(message);
+          
+          // Mark as delivered if it's for us
+          if (message.recipientContactId === user.contactId && message.status === 'sent') {
+            await ApiService.markMessageDelivered(message.id);
+          }
+        }
+
+        // Reload local messages to update UI
+        const updatedMessages = await getLocalMessages(contactId);
+        setMessages(updatedMessages);
+      }
+    } catch (error) {
+      console.error('Error polling messages:', error);
+    }
+  };
+
+  const sendMessage = useCallback(async (messageText) => {
+    if (!messageText.trim()) return;
+
+    try {
+      const localId = generateUniqueId();
+      const tempMessage = {
+        id: null,
+        localId,
+        senderContactId: user.contactId,
+        recipientContactId: contactId,
+        content: messageText.trim(),
+        messageType: 'text',
+        timestamp: new Date().toISOString(),
         status: 'sending',
       };
 
-      // Add to local messages immediately
-      addMessage(message);
+      // Add to local storage and UI immediately
+      await saveLocalMessage(tempMessage);
+      setMessages(prev => [...prev, tempMessage]);
 
-      // Send via WebSocket
-      wsSendMessage(contactId, messageText);
+      // Send to server
+      const response = await ApiService.sendMessage(
+        contactId, 
+        messageText.trim(), 
+        'text', 
+        localId
+      );
 
-      // Send via API for persistence
-      await ApiService.sendMessage({
-        message_id: messageId,
-        recipient_contact_id: contactId,
-        content: messageText,
-        message_type: 'text',
-        timestamp,
-      });
+      // Update message with server response
+      const updatedMessage = {
+        ...tempMessage,
+        id: response.messageId,
+        status: 'sent',
+        timestamp: response.timestamp,
+      };
 
-      // Update message status
-      updateMessageStatus(messageId, 'sent');
+      await saveLocalMessage(updatedMessage);
+      setMessages(prev => 
+        prev.map(msg => 
+          msg.localId === localId ? updatedMessage : msg
+        )
+      );
 
-    } catch (err) {
-      console.error('Error sending message:', err);
+    } catch (error) {
+      console.error('Error sending message:', error);
       setError('Failed to send message');
+      
+      // Mark message as failed
+      setMessages(prev => 
+        prev.map(msg => 
+          msg.localId === localId ? { ...msg, status: 'failed' } : msg
+        )
+      );
     }
-  }, [user?.id, contactId, wsSendMessage]);
+  }, [user, contactId]);
 
-  const addMessage = (message) => {
-    setMessages(prev => {
-      const exists = prev.find(m => m.id === message.id);
-      if (exists) return prev;
-      return [...prev, message].sort((a, b) => a.timestamp - b.timestamp);
-    });
+  const markAsRead = useCallback(async (messageId) => {
+    try {
+      await ApiService.markMessageRead(messageId);
+      
+      setMessages(prev => 
+        prev.map(msg => 
+          msg.id === messageId ? { ...msg, status: 'read' } : msg
+        )
+      );
+    } catch (error) {
+      console.error('Error marking message as read:', error);
+    }
+  }, []);
+
+  // Helper functions for local storage
+  const getLocalMessages = async (contactId) => {
+    try {
+      const key = `chat_${contactId}`;
+      const messages = await StorageService.getData(key);
+      return messages || [];
+    } catch (error) {
+      console.error('Error getting local messages:', error);
+      return [];
+    }
   };
 
-  const updateMessageStatus = (messageId, status) => {
-    setMessages(prev => prev.map(msg =>
-      msg.id === messageId ? { ...msg, status } : msg
-    ));
+  const saveLocalMessage = async (message) => {
+    try {
+      const chatPartnerId = message.senderContactId === user.contactId 
+        ? message.recipientContactId 
+        : message.senderContactId;
+      
+      const key = `chat_${chatPartnerId}`;
+      const existingMessages = await StorageService.getData(key) || [];
+      
+      // Check if message already exists
+      const messageExists = existingMessages.find(m => 
+        m.id === message.id || (m.localId && m.localId === message.localId)
+      );
+      
+      if (!messageExists) {
+        existingMessages.push(message);
+        // Sort by timestamp
+        existingMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        
+        await StorageService.storeData(key, existingMessages);
+      } else if (message.id) {
+        // Update existing message with server ID
+        const updatedMessages = existingMessages.map(m => 
+          (m.localId === message.localId) ? message : m
+        );
+        await StorageService.storeData(key, updatedMessages);
+      }
+    } catch (error) {
+      console.error('Error saving local message:', error);
+    }
   };
 
   return {
@@ -105,6 +180,7 @@ export function useChat(contactId) {
     loading,
     error,
     sendMessage,
-    chatId,
+    markAsRead,
+    refreshMessages: loadMessages,
   };
 }

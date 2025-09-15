@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useReducer, useEffect } from 'react';
 import FirebaseService from '../services/firebase';
-import DeviceStorageService from '../services/deviceStorage';
+import StorageService from '../services/storage';
 
 const AuthContext = createContext();
 
@@ -11,6 +11,27 @@ const initialState = {
   error: null,
   emailVerified: false,
 };
+
+// Helper function to build a unified user object combining Firebase Auth and Firestore profile
+async function buildFullUser(firebaseUser) {
+  if (!firebaseUser) return null;
+  // Get Firestore user profile
+  const profile = await FirebaseService.getCurrentUserProfile();
+  return {
+    // Firebase Auth data
+    uid: firebaseUser.uid,
+    email: firebaseUser.email,
+    token: await firebaseUser.getIdToken(),
+    emailVerified: firebaseUser.emailVerified,
+    phoneNumber: firebaseUser.phoneNumber || null,
+    photoURL: firebaseUser.photoURL || profile?.photoURL || null,
+    // Firestore profile data (has priority for the custom fields)
+    contactId: profile?.contactId || firebaseUser.uid,
+    displayName: profile?.displayName || firebaseUser.displayName || '',
+    // Add any extra profile data you want
+    ...profile,
+  };
+}
 
 function authReducer(state, action) {
   switch (action.type) {
@@ -53,18 +74,40 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     const unsubscribe = FirebaseService.onAuthStateChanged(handleAuthStateChange);
     return unsubscribe;
+    // eslint-disable-next-line
   }, []);
+
+  // Main function to setup state and storage after login/auth state
+  const initializeUserSession = async (firebaseUser) => {
+    try {
+      const fullUser = await buildFullUser(firebaseUser);
+
+      // Always store credentials for API authorization (with contactId, token, etc.)
+      if (fullUser) {
+        await StorageService.storeUserCredentials(fullUser.contactId, fullUser.token, fullUser.contactId);
+      }
+      if (StorageService.initializeForUser) {
+        await StorageService.initializeForUser(firebaseUser.uid);
+      }
+
+      dispatch({
+        type: 'AUTH_SUCCESS',
+        payload: { user: fullUser },
+      });
+    } catch (error) {
+      console.error('Error initializing user session:', error);
+      throw error;
+    }
+  };
 
   const handleAuthStateChange = async (firebaseUser) => {
     try {
       dispatch({ type: 'SET_LOADING', payload: true });
-
       if (firebaseUser) {
-        // User is authenticated
         await initializeUserSession(firebaseUser);
       } else {
-        // User is not authenticated
         dispatch({ type: 'LOGOUT' });
+        await StorageService.clearUserData();
       }
     } catch (error) {
       console.error('Auth state change error:', error);
@@ -72,35 +115,19 @@ export function AuthProvider({ children }) {
     }
   };
 
-  const initializeUserSession = async (firebaseUser) => {
-    try {
-      // Initialize device storage for this user (no encryption)
-      await DeviceStorageService.initializeForUser(firebaseUser.uid);
-
-      dispatch({
-        type: 'AUTH_SUCCESS',
-        payload: {
-          user: firebaseUser,
-        },
-      });
-
-    } catch (error) {
-      console.error('Error initializing user session:', error);
-      throw error;
-    }
-  };
-
+  // Auth/sign up actions: always refresh/full profile after the operation
   const signUpWithEmail = async (email, password, displayName) => {
     try {
       dispatch({ type: 'SET_LOADING', payload: true });
       dispatch({ type: 'CLEAR_ERROR' });
 
       const result = await FirebaseService.signUpWithEmail(email, password, displayName);
-      
+      if (result && result.user) {
+        await initializeUserSession(result.user);
+      }
       if (result.needsEmailVerification) {
         dispatch({ type: 'SET_ERROR', payload: 'Please verify your email address' });
       }
-
       return result;
     } catch (error) {
       dispatch({ type: 'SET_ERROR', payload: error.message });
@@ -114,11 +141,12 @@ export function AuthProvider({ children }) {
       dispatch({ type: 'CLEAR_ERROR' });
 
       const result = await FirebaseService.signInWithEmail(email, password);
-      
+      if (result && result.user) {
+        await initializeUserSession(result.user);
+      }
       if (result.needsEmailVerification) {
         dispatch({ type: 'SET_ERROR', payload: 'Please verify your email address' });
       }
-
       return result;
     } catch (error) {
       dispatch({ type: 'SET_ERROR', payload: error.message });
@@ -132,6 +160,9 @@ export function AuthProvider({ children }) {
       dispatch({ type: 'CLEAR_ERROR' });
 
       const result = await FirebaseService.signInWithGoogle();
+      if (result && result.user) {
+        await initializeUserSession(result.user);
+      }
       return result;
     } catch (error) {
       dispatch({ type: 'SET_ERROR', payload: error.message });
@@ -142,44 +173,28 @@ export function AuthProvider({ children }) {
   const logout = async () => {
     try {
       dispatch({ type: 'SET_LOADING', payload: true });
-      
-      // Clear device storage
-      await DeviceStorageService.clearUserData();
-      
-      // Sign out from Firebase
+      await StorageService.clearUserData();
       await FirebaseService.signOut();
-      
       dispatch({ type: 'LOGOUT' });
     } catch (error) {
       console.error('Logout error:', error);
-      // Force logout even if there's an error
       dispatch({ type: 'LOGOUT' });
     }
   };
 
-  const sendPasswordReset = async (email) => {
-    try {
-      await FirebaseService.sendPasswordReset(email);
-    } catch (error) {
-      throw error;
-    }
-  };
+  const sendPasswordReset = (email) => FirebaseService.sendPasswordReset(email);
+  const sendEmailVerification = () => FirebaseService.sendEmailVerification();
 
-  const sendEmailVerification = async () => {
-    try {
-      await FirebaseService.sendEmailVerification();
-    } catch (error) {
-      throw error;
-    }
-  };
-
+  // Reload user profile and merge in Firestore updates too
   const reloadUser = async () => {
     try {
       const updatedUser = await FirebaseService.reloadUser();
       if (updatedUser) {
+        const fullUser = await buildFullUser(updatedUser);
+        await StorageService.storeUserCredentials(fullUser.contactId, fullUser.token, fullUser.contactId);
         dispatch({
           type: 'UPDATE_USER',
-          payload: updatedUser,
+          payload: fullUser,
         });
       }
       return updatedUser;
@@ -191,10 +206,8 @@ export function AuthProvider({ children }) {
   const updateProfile = async (updates) => {
     try {
       const updatedUser = await FirebaseService.updateProfile(updates);
-      dispatch({
-        type: 'UPDATE_USER',
-        payload: updatedUser,
-      });
+      // After updating in auth, also update in Firestore (optional)
+      await reloadUser();
       return updatedUser;
     } catch (error) {
       throw error;
@@ -203,16 +216,20 @@ export function AuthProvider({ children }) {
 
   const getIdToken = async () => {
     try {
-      return await FirebaseService.getIdToken();
+      const user = FirebaseService.currentUser();
+      if (user) {
+        const idToken = await user.getIdToken();
+        await StorageService.storeUserCredentials(user.contactId, idToken, user.contactId);
+        return idToken;
+      }
+      return null;
     } catch (error) {
       console.error('Error getting ID token:', error);
       return null;
     }
   };
 
-  const clearError = () => {
-    dispatch({ type: 'CLEAR_ERROR' });
-  };
+  const clearError = () => dispatch({ type: 'CLEAR_ERROR' });
 
   return (
     <AuthContext.Provider
@@ -228,8 +245,7 @@ export function AuthProvider({ children }) {
         updateProfile,
         getIdToken,
         clearError,
-      }}
-    >
+      }}>
       {children}
     </AuthContext.Provider>
   );
