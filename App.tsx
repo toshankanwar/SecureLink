@@ -30,24 +30,24 @@ export default function App() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <SafeAreaProvider>
-        <ThemeProvider>
-          <AuthProvider>
-            <UserProvider>
-              <ChatProvider>
-                <ContactProvider>
-                  <StatusBar
-                    barStyle="light-content"
-                    backgroundColor="#00A884"
-                    translucent={Platform.OS === 'android'}
-                  />
-                  <AppNavigator />
-                </ContactProvider>
-              </ChatProvider>
-            </UserProvider>
-          </AuthProvider>
-        </ThemeProvider>
-      </SafeAreaProvider>
-    </GestureHandlerRootView>
+  <SafeAreaProvider>
+    <ThemeProvider>
+      <AuthProvider>
+        <UserProvider>
+          <ContactProvider>
+            <ChatProvider>
+              <StatusBar
+                barStyle="light-content"
+                backgroundColor="#00A884"
+                translucent={Platform.OS === 'android'}
+              />
+              <AppNavigator />
+            </ChatProvider>
+          </ContactProvider>
+        </UserProvider>
+      </AuthProvider>
+    </ThemeProvider>
+  </SafeAreaProvider>
+</GestureHandlerRootView>
   );
 }

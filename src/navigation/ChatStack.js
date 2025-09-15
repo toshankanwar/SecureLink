@@ -10,10 +10,8 @@ import ChatRoomScreen from '../screens/chat/ChatRoomScreen';
 import SettingsScreen from '../screens/chat/SettingsScreen';
 import ProfileScreen from '../screens/profile/ProfileScreen';
 import SecurityScreen from '../screens/profile/SecurityScreen';
-import ContactIdScreen from '../screens/auth/ContactIdScreen';
 
-// New contact-related screens
-import ContactsListScreen from '../screens/contacts/ContactsListScreen';
+// New merged AddContact screen
 import AddContactScreen from '../screens/contacts/AddContactScreen';
 
 import { useTheme } from '../context/ThemeContext';
@@ -47,19 +45,6 @@ function TabNavigator() {
           ),
         }}
       />
-      
-      {/* Add Contacts Tab */}
-      <Tab.Screen
-        name="ContactsTab"
-        component={ContactsListScreen}
-        options={{
-          title: 'Contacts',
-          tabBarIcon: ({ color, size }) => (
-            <Icon name="contacts" size={size} color={color} />
-          ),
-        }}
-      />
-      
       <Tab.Screen
         name="SettingsTab"
         component={SettingsScreen}
@@ -79,7 +64,7 @@ export default function ChatStack() {
 
   return (
     <Stack.Navigator
-      screenOptions={({ navigation }) => ({
+      screenOptions={{
         headerStyle: {
           backgroundColor: theme.primary,
         },
@@ -87,14 +72,13 @@ export default function ChatStack() {
         headerTitleStyle: {
           fontWeight: '600',
         },
-      })}
+      }}
     >
       <Stack.Screen
         name="MainTabs"
         component={TabNavigator}
         options={{ headerShown: false }}
       />
-      
       <Stack.Screen
         name={ROUTES.CHAT_ROOM}
         component={ChatRoomScreen}
@@ -110,27 +94,22 @@ export default function ChatStack() {
           ),
         })}
       />
-      
       <Stack.Screen
         name={ROUTES.PROFILE}
         component={ProfileScreen}
         options={{ title: 'Profile' }}
       />
-      
       <Stack.Screen
         name="SecurityScreen"
         component={SecurityScreen}
         options={{ title: 'Security' }}
       />
-      
-      {/* Updated ContactIdScreen as AddContact */}
+      {/* Only AddContactScreen route (no Contacts tab) */}
       <Stack.Screen
         name={ROUTES.CONTACT_ID_ENTRY}
         component={AddContactScreen}
         options={{ title: 'Add Contact' }}
       />
-      
-      {/* New AddContact screen (alternative route) */}
       <Stack.Screen
         name="AddContact"
         component={AddContactScreen}

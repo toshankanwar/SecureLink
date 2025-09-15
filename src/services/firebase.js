@@ -10,13 +10,12 @@ class FirebaseService {
 
   initializeGoogleSignIn() {
     GoogleSignin.configure({
-      webClientId: '896317303681-lc56cq4ens2j6cak1b99qvro4icfoiia.apps.googleusercontent.com', // <-- Correct client ID from Firebase console
+      webClientId: '896317303681-qjetqdl3kdq7661l0qrecquikqb6fkhk.apps.googleusercontent.com',
       offlineAccess: true,
       forceCodeForRefreshToken: true,
     });
   }
 
-  // Generate unique 10-digit ContactID
   async generateUniqueContactId() {
     let contactId;
     let isUnique = false;
@@ -163,7 +162,6 @@ class FirebaseService {
     try {
       await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       const userInfo = await GoogleSignin.signIn();
-      // Defensive: Try alternate property names for idToken
       const idToken = userInfo?.idToken || userInfo?.serverAuthCode || userInfo?.accessToken;
       if (!idToken) {
         throw new Error(
@@ -172,9 +170,7 @@ class FirebaseService {
       }
       const googleCredential = auth.GoogleAuthProvider.credential(idToken);
       const userCredential = await auth().signInWithCredential(googleCredential);
-
       const isNewUser = userCredential.additionalUserInfo?.isNewUser || false;
-      // Always generate and set contactId/profile for both new and existing users
       const contactId = await this.generateUniqueContactId();
       const profileData = await this.createUserProfile(userCredential.user, contactId);
 
@@ -205,8 +201,17 @@ class FirebaseService {
           lastSeen: firestore.FieldValue.serverTimestamp(),
         });
       }
-      const isGoogleSignedIn = await GoogleSignin.isSignedIn();
-      if (isGoogleSignedIn) await GoogleSignin.signOut();
+      // Defensive check: only call GoogleSignin if the methods exist
+      if (
+        GoogleSignin &&
+        typeof GoogleSignin.isSignedIn === 'function' &&
+        typeof GoogleSignin.signOut === 'function'
+      ) {
+        const isGoogleSignedIn = await GoogleSignin.isSignedIn();
+        if (isGoogleSignedIn) {
+          await GoogleSignin.signOut();
+        }
+      }
       await auth().signOut();
     } catch (error) {
       throw this.handleFirebaseError(error);

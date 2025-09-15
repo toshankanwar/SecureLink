@@ -13,51 +13,76 @@ export function ContactProvider({ children }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (user && userProfile) {
-      loadContacts();
+    if (!user || !userProfile) {
+      setContacts([]);
+      setLoading(false);
+      return;
     }
-  }, [user, userProfile]);
-
-  const loadContacts = () => {
-    if (!user) return;
-
+    setLoading(true);
     const unsubscribe = firestore()
       .collection('users')
       .doc(user.uid)
       .collection('contacts')
       .orderBy('addedAt', 'desc')
-      .onSnapshot((snapshot) => {
-        const contactsList = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-        }));
-        setContacts(contactsList);
-        setLoading(false);
-      });
-
+      .onSnapshot(
+        (snapshot) => {
+          if (snapshot && snapshot.docs) {
+            const contactsList = snapshot.docs.map(doc => ({
+              id: doc.id,
+              ...doc.data(),
+            }));
+            setContacts(contactsList);
+          } else {
+            setContacts([]);
+          }
+          setLoading(false);
+        },
+        (error) => {
+          console.error('Firestore contacts error:', error);
+          setContacts([]);
+          setLoading(false);
+        }
+      );
     return () => unsubscribe();
-  };
+  }, [user, userProfile]);
 
   const addContact = async (contactId) => {
     try {
-      // Search user by ContactID
-      const foundUser = await FirebaseService.findUserByContactId(contactId);
-      
-      if (!foundUser) {
-        throw new Error('User not found with this Contact ID');
+      if (!user || !userProfile) {
+        throw new Error('User profile not loaded. Please try again.');
       }
-
-      if (foundUser.contactId === userProfile.contactId) {
-        throw new Error('You cannot add yourself as a contact');
+  
+      // Self-contact guard
+      if (contactId === userProfile.contactId) {
+        throw new Error('You cannot add yourself as a contact.');
       }
-
-      // Check if contact already exists
+  
+      // Prevent duplicate
       const existingContact = contacts.find(c => c.contactId === contactId);
-      if (existingContact) {
-        throw new Error('Contact already added');
+      if (existingContact) throw new Error('Contact already added.');
+  
+      // Query users for this contactId
+      const userQuery = await firestore()
+        .collection('users')
+        .where('contactId', '==', contactId)
+        .get();
+  
+      if (userQuery.empty) {
+        throw new Error('User not found with this Contact ID.');
       }
-
-      // Add to user's contacts subcollection
+  
+      // Grab first matching user's info
+      const userDoc = userQuery.docs[0];
+      const foundUser = {
+        uid: userDoc.id,
+        ...(userDoc.data() || {}),
+      };
+  
+      // Safety: Make sure all required fields exist
+      if (!foundUser.uid || !foundUser.displayName)
+        throw new Error('User profile is invalid or incomplete.');
+  
+      // Add to contacts
       await firestore()
         .collection('users')
         .doc(user.uid)
@@ -67,11 +92,11 @@ export function ContactProvider({ children }) {
           uid: foundUser.uid,
           contactId: foundUser.contactId,
           displayName: foundUser.displayName,
-          photoURL: foundUser.photoURL,
+          photoURL: foundUser.photoURL || '',
           addedAt: firestore.FieldValue.serverTimestamp(),
           chatRoomId: null,
         });
-
+  
       return foundUser;
     } catch (error) {
       console.error('Error adding contact:', error);
@@ -95,22 +120,23 @@ export function ContactProvider({ children }) {
 
   const searchContacts = (searchText) => {
     if (!searchText.trim()) return contacts;
-    
     const lowercaseSearch = searchText.toLowerCase();
-    return contacts.filter(contact => 
-      contact.displayName.toLowerCase().includes(lowercaseSearch) ||
-      contact.contactId.includes(searchText)
+    return contacts.filter(contact =>
+      (contact.displayName && contact.displayName.toLowerCase().includes(lowercaseSearch)) ||
+      (contact.contactId && contact.contactId.includes(searchText))
     );
   };
 
+  const refreshContacts = () => setLoading(true);
+
   return (
-    <ContactContext.Provider value={{ 
-      contacts, 
-      loading, 
-      addContact, 
-      removeContact, 
+    <ContactContext.Provider value={{
+      contacts,
+      loading,
+      addContact,
+      removeContact,
       searchContacts,
-      refreshContacts: loadContacts 
+      refreshContacts
     }}>
       {children}
     </ContactContext.Provider>
