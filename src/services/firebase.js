@@ -21,19 +21,23 @@ class FirebaseService {
     let isUnique = false;
     let attempts = 0;
     const maxAttempts = 10;
+    
     while (!isUnique && attempts < maxAttempts) {
       const timestamp = Date.now().toString().slice(-6);
       const randomNum = Math.floor(1000 + Math.random() * 9000);
       contactId = timestamp + randomNum.toString();
+      
       const existingUser = await firestore()
         .collection('users')
         .where('contactId', '==', contactId)
         .get();
+        
       if (existingUser.empty) {
         isUnique = true;
       }
       attempts++;
     }
+    
     if (!isUnique) {
       throw new Error('Failed to generate unique Contact ID');
     }
@@ -41,7 +45,6 @@ class FirebaseService {
   }
 
   async createUserProfile(user, contactId, photoURL = null) {
-    // 'user' here must only have simple fields
     const profileData = {
       uid: user.uid,
       contactId: contactId,
@@ -61,9 +64,11 @@ class FirebaseService {
         onlineStatusVisible: true,
       }
     };
+    
     await firestore().collection('users').doc(user.uid).set(profileData);
     return profileData;
   }
+
   getCloudinaryPhotoUrl(contactId, transformation = 'w_400,h_400,c_fill,f_auto,q_auto') {
     return `https://res.cloudinary.com/drlxxyu9o/image/upload/${transformation}/securelink/profile_pictures/profile_${contactId}.jpg`;
   }
@@ -71,10 +76,12 @@ class FirebaseService {
   async findUserByContactId(contactId) {
     try {
       if (!contactId || contactId.length !== 10) return null;
+      
       const userQuery = await firestore()
         .collection('users')
         .where('contactId', '==', contactId)
         .get();
+        
       if (!userQuery.empty) {
         const userData = userQuery.docs[0].data();
         return {
@@ -109,6 +116,7 @@ class FirebaseService {
     try {
       const user = auth().currentUser;
       if (!user) return null;
+      
       const userDoc = await firestore().collection('users').doc(user.uid).get();
       return userDoc.exists ? userDoc.data() : null;
     } catch (error) {
@@ -120,26 +128,23 @@ class FirebaseService {
   async signUpWithEmail(email, password, displayName) {
     try {
       const userCredential = await auth().createUserWithEmailAndPassword(email, password);
-  
+
       await userCredential.user.updateProfile({ displayName });
-  
       await auth().currentUser.reload();
       const updatedUser = auth().currentUser;
-  
+
       const contactId = await this.generateUniqueContactId();
-  
-      // IMPORTANT: Only pass the needed simple fields, never the raw user
+
       const userForProfile = {
         uid: updatedUser.uid,
         displayName,
         email: updatedUser.email,
         photoURL: updatedUser.photoURL || this.getCloudinaryPhotoUrl(contactId),
       };
-  
+
       const profileData = await this.createUserProfile(userForProfile, contactId);
-  
       await userCredential.user.sendEmailVerification();
-  
+
       return {
         user: updatedUser,
         contactId,
@@ -150,15 +155,18 @@ class FirebaseService {
       throw this.handleFirebaseError(error);
     }
   }
+
   async signInWithEmail(email, password) {
     try {
       const userCredential = await auth().signInWithEmailAndPassword(email, password);
+      
       if (userCredential.user) {
         await this.updateUserProfile(userCredential.user.uid, {
           isOnline: true,
           lastSeen: firestore.FieldValue.serverTimestamp(),
         });
       }
+      
       return {
         user: userCredential.user,
         needsEmailVerification: !userCredential.user.emailVerified,
@@ -173,21 +181,32 @@ class FirebaseService {
       await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       const userInfo = await GoogleSignin.signIn();
       const idToken = userInfo?.idToken || userInfo?.serverAuthCode || userInfo?.accessToken;
+      
       if (!idToken) {
         throw new Error(
           'Google sign-in failed: No ID token received. Make sure you configured the SHA1 key for your app in Firebase and use the proper webClientId.'
         );
       }
+      
       const googleCredential = auth.GoogleAuthProvider.credential(idToken);
       const userCredential = await auth().signInWithCredential(googleCredential);
       const isNewUser = userCredential.additionalUserInfo?.isNewUser || false;
-      const contactId = await this.generateUniqueContactId();
-      const profileData = await this.createUserProfile(userCredential.user, contactId);
+
+      let contactId;
+      let profileData;
+
+      if (isNewUser) {
+        contactId = await this.generateUniqueContactId();
+        profileData = await this.createUserProfile(userCredential.user, contactId);
+      } else {
+        // Get existing profile data
+        profileData = await this.getCurrentUserProfile();
+        contactId = profileData?.contactId;
+      }
 
       await this.updateUserProfile(userCredential.user.uid, {
         isOnline: true,
         lastSeen: firestore.FieldValue.serverTimestamp(),
-        contactId,
       });
 
       return {
@@ -205,13 +224,14 @@ class FirebaseService {
   async signOut() {
     try {
       const user = auth().currentUser;
+      
       if (user) {
         await this.updateUserProfile(user.uid, {
           isOnline: false,
           lastSeen: firestore.FieldValue.serverTimestamp(),
         });
       }
-      // Defensive check: only call GoogleSignin if the methods exist
+
       if (
         GoogleSignin &&
         typeof GoogleSignin.isSignedIn === 'function' &&
@@ -222,6 +242,7 @@ class FirebaseService {
           await GoogleSignin.signOut();
         }
       }
+
       await auth().signOut();
     } catch (error) {
       throw this.handleFirebaseError(error);
@@ -306,22 +327,10 @@ class FirebaseService {
     return auth().currentUser;
   }
 
-  async getIdToken(forceRefresh = false) {
-    try {
-      const user = auth().currentUser;
-      if (user) {
-        return await user.getIdToken(forceRefresh);
-      }
-      return null;
-    } catch (error) {
-      console.error('Error getting ID token:', error);
-      return null;
-    }
-  }
-
   handleFirebaseError(error) {
     const code = (error && (error.code || error.errorCode)) || null;
     const message = (error && error.message) || 'An error occurred';
+    
     switch (code) {
       case 'auth/user-not-found':
         return new Error('No account found with this email');

@@ -10,18 +10,20 @@ import {
   Alert,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
-import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
+import FirebaseService from '../../services/firebase';
 import Button from '../../components/common/Button';
 import Input from '../../components/common/Input';
 import { typography } from '../../styles/typography';
 import { ROUTES } from '../../utils/constants';
 
 export default function LoginScreen({ navigation }) {
-  const { signInWithEmail, signInWithGoogle, loading, error, clearError } = useAuth();
   const { theme } = useTheme();
+
   const [formData, setFormData] = useState({ email: '', password: '' });
   const [formErrors, setFormErrors] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
   const validateForm = () => {
     const errors = {};
@@ -39,70 +41,72 @@ export default function LoginScreen({ navigation }) {
 
   const handleLogin = async () => {
     if (!validateForm()) return;
-    
+
+    setLoading(true);
+    setError('');
+
     try {
-      clearError();
-      const result = await signInWithEmail(formData.email.trim(), formData.password);
-      
-      // Handle email verification if needed
-      if (result?.needsEmailVerification) {
-        Alert.alert(
-          'Email Verification Required',
-          'Please verify your email address before signing in. Check your email for verification link.',
-          [{ text: 'OK' }]
-        );
+      // Direct Firebase login - no token storage
+      const result = await FirebaseService.signInWithEmail(
+        formData.email.trim().toLowerCase(),
+        formData.password
+      );
+
+      if (result && result.user) {
+        // Check if email verification is needed
+        if (result.needsEmailVerification && !result.user.emailVerified) {
+          Alert.alert(
+            'Email Verification Required',
+            'Please verify your email address before signing in. Check your email for the verification link.',
+            [{ text: 'OK' }]
+          );
+          setLoading(false);
+          return;
+        }
+
+        console.log('Login successful:', result.user.uid);
+        
+        // Navigate to main app - Firebase handles the session automatically
+        navigation.replace(ROUTES.HOME || 'Home');
       }
     } catch (err) {
-      // Error is handled by AuthContext
-      console.error('Login failed:', err);
+      console.error('Login error:', err);
+      setError(err.message || 'Login failed. Please check your credentials.');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleGoogleSignIn = async () => {
-    try {
-      clearError();
-      const result = await signInWithGoogle();
-      
-      // Success feedback for new users
-      if (result?.isNewUser) {
-        Alert.alert(
-          'Welcome to SecureLink!',
-          'Your Google account has been successfully linked.',
-          [{ text: 'Get Started' }]
-        );
-      }
-    } catch (err) {
-      // Error is handled by AuthContext, but provide user feedback
-      console.error('Google sign-in failed:', err);
-      
-      // Show specific error for common Google Sign-In issues
-      const errorMessage = err?.message || 'Google sign-in failed';
-      if (errorMessage.includes('DEVELOPER_ERROR')) {
-        Alert.alert(
-          'Configuration Error',
-          'Google Sign-In is not properly configured. Please contact support.',
-          [{ text: 'OK' }]
-        );
-      } else if (errorMessage.includes('SIGN_IN_CANCELLED')) {
-        // User cancelled - no need to show error
-        console.log('User cancelled Google sign-in');
-      } else {
-        Alert.alert('Sign-In Error', 'Failed to sign in with Google. Please try again.');
-      }
-    }
+  // Google Sign-In removed - show alert instead
+  const handleGoogleSignIn = () => {
+    Alert.alert(
+      'Google Sign-In Unavailable',
+      'Google Sign-In is currently disabled. Please use email and password to sign in.',
+      [{ text: 'OK' }]
+    );
   };
 
   const handleInputChange = (field, value) => {
     setFormData(prev => ({ ...prev, [field]: value }));
+    
+    // Clear field-specific errors when user types
     if (formErrors[field]) {
       setFormErrors(prev => ({ ...prev, [field]: null }));
     }
+    
+    // Clear general error
     if (error) {
-      clearError();
+      setError('');
     }
   };
 
-  const gotoForgot = () => navigation.navigate(ROUTES.FORGOT_PASSWORD);
+  const handleForgotPassword = () => {
+    navigation.navigate(ROUTES.FORGOT_PASSWORD || 'ForgotPassword');
+  };
+
+  const handleCreateAccount = () => {
+    navigation.navigate(ROUTES.REGISTER || 'Register');
+  };
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -110,24 +114,16 @@ export default function LoginScreen({ navigation }) {
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         style={styles.keyboardView}
       >
-        <ScrollView 
-          contentContainerStyle={styles.scrollContent} 
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.header}>
-            <Text style={[
-              styles.title,
-              { color: theme.text },
-              typography.h1,
-            ]}>
+            <Text style={[styles.title, { color: theme.text }, typography.h1]}>
               Sign In
             </Text>
-            <Text style={[
-              styles.subtitle,
-              { color: theme.textSecondary },
-              typography.body1,
-            ]}>
+            <Text style={[styles.subtitle, { color: theme.textSecondary }, typography.body1]}>
               Welcome back to SecureLink
             </Text>
           </View>
@@ -162,6 +158,7 @@ export default function LoginScreen({ navigation }) {
               title="Sign In"
               onPress={handleLogin}
               loading={loading}
+              disabled={loading}
               style={styles.loginButton}
             />
 
@@ -177,7 +174,8 @@ export default function LoginScreen({ navigation }) {
               title="Sign In with Google"
               variant="secondary"
               onPress={handleGoogleSignIn}
-              loading={loading}
+              loading={false}
+              disabled={false}
               icon={<Icon name="google" size={20} color={theme.primary} />}
               style={styles.googleButton}
             />
@@ -185,44 +183,32 @@ export default function LoginScreen({ navigation }) {
             <Button
               title="Forgot Password?"
               variant="ghost"
-              onPress={gotoForgot}
+              onPress={handleForgotPassword}
               style={styles.forgotButton}
             />
 
-            {error && (
-              <Text style={[
-                styles.errorText,
-                { color: theme.error },
-                typography.body2,
-              ]}>
+            {error ? (
+              <Text style={[styles.errorText, { color: theme.error }, typography.body2]}>
                 {error}
               </Text>
-            )}
+            ) : null}
           </View>
 
           <View style={styles.footer}>
-            <Text style={[
-              styles.footerText,
-              { color: theme.textSecondary },
-              typography.body2,
-            ]}>
-              Don&apos;t have an account?
+            <Text style={[styles.footerText, { color: theme.textSecondary }, typography.body2]}>
+              Don't have an account?
             </Text>
             <Button
               title="Create Account"
               variant="ghost"
-              onPress={() => navigation.navigate(ROUTES.REGISTER)}
+              onPress={handleCreateAccount}
               style={styles.registerButton}
             />
           </View>
 
           <View style={styles.securityInfo}>
-            <Text style={[
-              styles.securityText,
-              { color: theme.textSecondary },
-              typography.caption,
-            ]}>
-              🔒 End-to-end encrypted by SecureLink
+            <Text style={[styles.securityText, { color: theme.textSecondary }, typography.caption]}>
+              🔒 Secured by Firebase Authentication
             </Text>
           </View>
         </ScrollView>
@@ -232,77 +218,77 @@ export default function LoginScreen({ navigation }) {
 }
 
 const styles = StyleSheet.create({
-  container: { 
-    flex: 1 
+  container: {
+    flex: 1,
   },
-  keyboardView: { 
-    flex: 1 
+  keyboardView: {
+    flex: 1,
   },
-  scrollContent: { 
-    flexGrow: 1, 
-    justifyContent: 'center', 
+  scrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
     paddingHorizontal: 24,
     paddingVertical: 20,
   },
-  header: { 
-    alignItems: 'center', 
-    marginBottom: 36 
+  header: {
+    alignItems: 'center',
+    marginBottom: 36,
   },
-  title: { 
-    textAlign: 'center', 
-    marginBottom: 8 
+  title: {
+    textAlign: 'center',
+    marginBottom: 8,
   },
-  subtitle: { 
-    textAlign: 'center' 
+  subtitle: {
+    textAlign: 'center',
   },
-  form: { 
-    marginBottom: 32 
+  form: {
+    marginBottom: 32,
   },
-  loginButton: { 
-    marginTop: 24 
+  loginButton: {
+    marginTop: 24,
   },
-  divider: { 
-    flexDirection: 'row', 
-    alignItems: 'center', 
-    marginVertical: 24 
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 24,
   },
-  dividerLine: { 
-    flex: 1, 
-    height: 1 
+  dividerLine: {
+    flex: 1,
+    height: 1,
   },
-  dividerText: { 
-    marginHorizontal: 16 
+  dividerText: {
+    marginHorizontal: 16,
   },
-  googleButton: { 
-    marginTop: 0, 
-    width: '100%', 
-    borderRadius: 8 
+  googleButton: {
+    marginTop: 0,
+    width: '100%',
+    borderRadius: 8,
   },
-  forgotButton: { 
-    marginTop: 14, 
-    paddingVertical: 8, 
-    alignSelf: 'flex-end' 
+  forgotButton: {
+    marginTop: 14,
+    paddingVertical: 8,
+    alignSelf: 'flex-end',
   },
-  errorText: { 
-    textAlign: 'center', 
-    marginTop: 16 
+  errorText: {
+    textAlign: 'center',
+    marginTop: 16,
   },
-  footer: { 
-    alignItems: 'center' 
+  footer: {
+    alignItems: 'center',
   },
-  footerText: { 
-    marginBottom: 8 
+  footerText: {
+    marginBottom: 8,
   },
-  registerButton: { 
-    paddingVertical: 8 
+  registerButton: {
+    paddingVertical: 8,
   },
-  securityInfo: { 
-    alignItems: 'center', 
-    marginTop: 32, 
-    paddingTop: 16 
+  securityInfo: {
+    alignItems: 'center',
+    marginTop: 32,
+    paddingTop: 16,
   },
-  securityText: { 
-    textAlign: 'center', 
-    marginVertical: 2 
+  securityText: {
+    textAlign: 'center',
+    marginVertical: 2,
   },
 });

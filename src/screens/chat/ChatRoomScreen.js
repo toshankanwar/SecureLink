@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   View,
   FlatList,
@@ -10,179 +10,517 @@ import {
   Image,
   StatusBar,
   TouchableOpacity,
+  TextInput,
+  Alert,
+  ActivityIndicator,
 } from 'react-native';
 import { useRoute } from '@react-navigation/native';
 import { useTheme } from '../../context/ThemeContext';
 import { useAuth } from '../../context/AuthContext';
-import { useUser } from '../../context/UserContext'; // For getUserProfileByContactId
-import { useChat } from '../../hooks/useChat';
-import MessageBubble from '../../components/chat/MessageBubble';
-import ChatInput from '../../components/chat/ChatInput';
-import LoadingSpinner from '../../components/common/LoadingSpinner';
+import StorageService from '../../services/storage';
+import auth from '@react-native-firebase/auth';
+import firestore from '@react-native-firebase/firestore';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+import io from 'socket.io-client';
 
-const AVATAR_SIZE = 40;
-const DEFAULT_AVATAR =
-  'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png';
+const SERVER_URL = 'http://192.168.1.105:8080';
 
 export default function ChatRoomScreen({ navigation }) {
   const route = useRoute();
   const { theme } = useTheme();
   const { user } = useAuth();
-  const { getUserProfileByContactId } = useUser();
+  
+  // Route params
+  const { contactId, contactName, contactPhoto } = route.params || {};
+  
+  // State management
+  const [messages, setMessages] = useState([]);
+  const [inputText, setInputText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [contactProfile, setContactProfile] = useState(null);
+  const [isOnline, setIsOnline] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
+  const [lastSeen, setLastSeen] = useState(null);
+  
+  // Refs
+  const flatListRef = useRef(null);
+  const socketRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
 
-  // Extract params from navigation
-  const {
-    contactId: navContactId,
-    displayName: navDisplayName,
-    photoURL: navPhotoURL
-  } = route.params ?? {};
-
-  // Defensive: Ensure we have a contactId
-  const contactId = navContactId;
-  const contactProfile = getUserProfileByContactId
-    ? getUserProfileByContactId(contactId)
-    : undefined;
-
-  // Use actual displayName from context/profile first, then navigation prop, then ""
-  const displayName =
-    contactProfile?.displayName ||
-    navDisplayName ||
-    "";
-
-  // Avatar URL selection order: context/profile, nav param, fallback
-  const avatarUrl =
-    contactProfile?.photoURL ||
-    navPhotoURL ||
-    DEFAULT_AVATAR;
-
-  const isAuthenticated = !!user && !!user.token;
-
-  const { messages = [], loading, sendMessage } = useChat(
-    isAuthenticated ? contactId : null
-  );
-  const [refreshing, setRefreshing] = useState(false);
-
+  // Initialize component
   useEffect(() => {
-    navigation.setOptions({
-      header: () => (
-        <View
-          style={[
-            styles.header,
-            {
-              backgroundColor: theme.primary,
-              paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 24,
-            },
-          ]}
-        >
-          <TouchableOpacity
-            style={styles.headerBackButton}
-            onPress={() => navigation.goBack()}
-            hitSlop={{ top: 10, left: 10, right: 10, bottom: 10 }}
-          >
-            <Icon name="arrow-back" size={28} color={theme.textOnPrimary} />
-          </TouchableOpacity>
-          <Image source={{ uri: avatarUrl }} style={styles.headerAvatar} />
-          <View style={styles.headerTextContainer}>
-            <Text style={[styles.headerName, { color: theme.textOnPrimary }]}>
-              {displayName && displayName.trim().length > 0
-                ? displayName
-                : 'No Name'}
-            </Text>
-            {contactId ? (
-              <Text
-                style={[
-                  styles.headerId,
-                  { color: theme.textOnPrimary, opacity: 0.7 },
-                ]}
-              >
-                ID: {contactId}
-              </Text>
-            ) : null}
-          </View>
-        </View>
-      ),
-      headerStyle: {
-        backgroundColor: theme.primary,
-        elevation: 0,
-        shadowOpacity: 0,
-        borderBottomWidth: 0,
-      },
-    });
-  }, [navigation, displayName, contactId, avatarUrl, theme]);
-
-  const handleSendMessage = async (messageText) => {
-    if (!isAuthenticated) {
-      alert('You need to log in again to send a message.');
+    if (!user?.uid || !contactId) {
+      navigation.goBack();
       return;
     }
-    try {
-      await sendMessage(messageText);
-    } catch (error) {
-      if (
-        error.message?.toLowerCase().includes('authorization') ||
-        error.message?.toLowerCase().includes('token') ||
-        error.message?.toLowerCase().includes('unauthorized')
-      ) {
-        alert('Session expired. Please re-login.');
-        navigation.navigate('Login');
-      } else {
-        console.error('Failed to send message:', error);
+
+    loadContactProfile();
+    loadMessages();
+    setupWebSocket();
+    setupFirebaseListener();
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
       }
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+    };
+  }, [contactId, user]);
+
+  // Load contact profile
+  const loadContactProfile = async () => {
+    try {
+      // Try to get from local storage first
+      const localContact = await StorageService.getContact(contactId);
+      if (localContact) {
+        setContactProfile(localContact);
+      }
+
+      // Fetch from Firebase for updated info
+      const userQuery = await firestore()
+        .collection('users')
+        .where('contactId', '==', contactId)
+        .limit(1)
+        .get();
+
+      if (!userQuery.empty) {
+        const userData = userQuery.docs[0].data();
+        const profile = {
+          contactId: userData.contactId,
+          displayName: userData.displayName,
+          photoURL: userData.photoURL,
+          isOnline: userData.isOnline || false,
+          lastSeen: userData.lastSeen,
+        };
+        
+        setContactProfile(profile);
+        setIsOnline(profile.isOnline);
+        setLastSeen(profile.lastSeen);
+        
+        // Save to local storage
+        await StorageService.addContact(profile);
+      }
+    } catch (error) {
+      console.error('Error loading contact profile:', error);
     }
   };
 
-  const handleRefresh = async () => {
-    setRefreshing(true);
-    setTimeout(() => setRefreshing(false), 800);
+  // Load messages from local storage
+  const loadMessages = async () => {
+    try {
+      setLoading(true);
+      const localMessages = await StorageService.getChatMessages(contactId);
+      setMessages(localMessages.reverse()); // Reverse for FlatList inverted
+    } catch (error) {
+      console.error('Error loading messages:', error);
+    } finally {
+      setLoading(false);
+    }
   };
 
+  // Setup WebSocket connection
+  const setupWebSocket = async () => {
+    try {
+      const currentUser = auth().currentUser;
+      if (!currentUser) return;
+
+      const idToken = await currentUser.getIdToken();
+      
+      socketRef.current = io(SERVER_URL, {
+        transports: ['websocket'],
+        timeout: 20000,
+      });
+
+      socketRef.current.on('connect', () => {
+        console.log('🔌 Connected to WebSocket server');
+        
+        // Authenticate with server
+        socketRef.current.emit('authenticate', {
+          token: idToken,
+          contactId: user.contactId || user.uid,
+        });
+      });
+
+      socketRef.current.on('authenticated', () => {
+        console.log('✅ WebSocket authenticated');
+      });
+
+      socketRef.current.on('new_message', (messageData) => {
+        if (messageData.senderContactId === contactId) {
+          handleNewMessage(messageData);
+        }
+      });
+
+      socketRef.current.on('user_online', (data) => {
+        if (data.contactId === contactId) {
+          setIsOnline(true);
+        }
+      });
+
+      socketRef.current.on('user_offline', (data) => {
+        if (data.contactId === contactId) {
+          setIsOnline(false);
+          setLastSeen(new Date().toISOString());
+        }
+      });
+
+      socketRef.current.on('typing_start', (data) => {
+        if (data.contactId === contactId) {
+          setIsTyping(true);
+        }
+      });
+
+      socketRef.current.on('typing_stop', (data) => {
+        if (data.contactId === contactId) {
+          setIsTyping(false);
+        }
+      });
+
+      socketRef.current.on('disconnect', () => {
+        console.log('❌ Disconnected from WebSocket server');
+      });
+
+    } catch (error) {
+      console.error('WebSocket setup error:', error);
+    }
+  };
+
+  // Setup Firebase listener for contact status
+  const setupFirebaseListener = () => {
+    const unsubscribe = firestore()
+      .collection('users')
+      .where('contactId', '==', contactId)
+      .limit(1)
+      .onSnapshot((snapshot) => {
+        if (!snapshot.empty) {
+          const userData = snapshot.docs[0].data();
+          setIsOnline(userData.isOnline || false);
+          setLastSeen(userData.lastSeen);
+        }
+      });
+
+    return unsubscribe;
+  };
+
+  // Handle new incoming message
+  const handleNewMessage = async (messageData) => {
+    try {
+      // Add to local storage
+      await StorageService.addChatMessage(contactId, messageData);
+      
+      // Update messages state
+      setMessages(prev => [messageData, ...prev]);
+      
+      // Update chat metadata
+      await StorageService.updateChatMetadata(contactId, {
+        lastMessage: messageData.content,
+        lastMessageTime: messageData.timestamp,
+        displayName: contactProfile?.displayName || contactId,
+        unreadCount: 1, // Increment unread count
+      });
+
+      // Mark as delivered
+      markMessageDelivered(messageData.id);
+      
+    } catch (error) {
+      console.error('Error handling new message:', error);
+    }
+  };
+
+  // Send message
+  const sendMessage = async () => {
+    if (!inputText.trim() || sending) return;
+
+    const messageText = inputText.trim();
+    setInputText('');
+    setSending(true);
+
+    try {
+      const currentUser = auth().currentUser;
+      if (!currentUser) {
+        Alert.alert('Error', 'Please login again to send messages');
+        return;
+      }
+
+      const idToken = await currentUser.getIdToken();
+      const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      // Create message object
+      const messageData = {
+        id: messageId,
+        senderContactId: user.contactId || user.uid,
+        recipientContactId: contactId,
+        content: messageText,
+        timestamp: new Date().toISOString(),
+        messageType: 'text',
+        status: 'sending',
+      };
+
+      // Add to UI immediately (optimistic update)
+      setMessages(prev => [messageData, ...prev]);
+      
+      // Save to local storage
+      await StorageService.addChatMessage(contactId, messageData);
+
+      // Send to server
+      const response = await fetch(`${SERVER_URL}/api/chat/send`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          recipientContactId: contactId,
+          content: messageText,
+          messageType: 'text',
+        }),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        
+        // Update message status to sent
+        const updatedMessage = { ...messageData, status: 'sent', id: result.messageId };
+        setMessages(prev => prev.map(msg => msg.id === messageId ? updatedMessage : msg));
+        
+        // Update local storage
+        await StorageService.updateMessageStatus(contactId, messageId, 'sent');
+        
+        // Update chat metadata
+        await StorageService.updateChatMetadata(contactId, {
+          lastMessage: messageText,
+          lastMessageTime: updatedMessage.timestamp,
+          displayName: contactProfile?.displayName || contactId,
+        });
+
+      } else {
+        throw new Error('Failed to send message');
+      }
+      
+    } catch (error) {
+      console.error('Send message error:', error);
+      
+      // Update message status to failed
+      setMessages(prev => prev.map(msg => 
+        msg.content === messageText && msg.status === 'sending' 
+          ? { ...msg, status: 'failed' } 
+          : msg
+      ));
+      
+      Alert.alert('Error', 'Failed to send message. Please try again.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Mark message as delivered
+  const markMessageDelivered = async (messageId) => {
+    try {
+      const currentUser = auth().currentUser;
+      if (!currentUser) return;
+
+      const idToken = await currentUser.getIdToken();
+      
+      await fetch(`${SERVER_URL}/api/chat/delivered/${messageId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`,
+        },
+      });
+    } catch (error) {
+      console.error('Mark delivered error:', error);
+    }
+  };
+
+  // Handle typing indicators
+  const handleTextChange = (text) => {
+    setInputText(text);
+    
+    // Send typing indicator
+    if (socketRef.current && text.length > 0) {
+      socketRef.current.emit('typing_start', { contactId });
+      
+      // Clear previous timeout
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+      
+      // Stop typing after 2 seconds of inactivity
+      typingTimeoutRef.current = setTimeout(() => {
+        socketRef.current.emit('typing_stop', { contactId });
+      }, 2000);
+    } else if (socketRef.current) {
+      socketRef.current.emit('typing_stop', { contactId });
+    }
+  };
+
+  // Get time ago string
+  const getTimeAgo = (timestamp) => {
+    try {
+      const now = new Date();
+      const messageTime = new Date(timestamp);
+      const diffMs = now - messageTime;
+      const diffMins = Math.floor(diffMs / (1000 * 60));
+      const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+
+      if (diffMins < 1) return 'now';
+      if (diffMins < 60) return `${diffMins}m ago`;
+      if (diffHours < 24) return `${diffHours}h ago`;
+      return messageTime.toLocaleDateString();
+    } catch {
+      return '';
+    }
+  };
+
+  // Render message bubble
   const renderMessage = ({ item, index }) => {
-    const isOwn =
-      user &&
-      (item.sender_id === user.uid || item.senderContactId === user.contactId);
-    const showAvatar =
-      index === 0 ||
-      (messages[index - 1]?.sender_id !== item.sender_id &&
-        messages[index - 1]?.senderContactId !== item.senderContactId);
+    const isOwn = item.senderContactId === (user.contactId || user.uid);
+    const showTimestamp = index === 0 || 
+      (messages[index - 1] && new Date(item.timestamp) - new Date(messages[index - 1].timestamp) > 300000); // 5 minutes
 
     return (
-      <MessageBubble
-        message={item}
-        isOwn={isOwn}
-        showAvatar={showAvatar}
-      />
+      <View style={styles.messageContainer}>
+        {showTimestamp && (
+          <Text style={[styles.timestamp, { color: theme.textSecondary }]}>
+            {new Date(item.timestamp).toLocaleTimeString([], { 
+              hour: '2-digit', 
+              minute: '2-digit' 
+            })}
+          </Text>
+        )}
+        
+        <View style={[
+          styles.messageBubble,
+          isOwn ? [styles.ownMessage, { backgroundColor: theme.primary }] 
+                : [styles.otherMessage, { backgroundColor: theme.surface }]
+        ]}>
+          <Text style={[
+            styles.messageText,
+            { color: isOwn ? theme.textOnPrimary : theme.text }
+          ]}>
+            {item.content}
+          </Text>
+          
+          <View style={styles.messageFooter}>
+            <Text style={[
+              styles.messageTime,
+              { color: isOwn ? theme.textOnPrimary + '80' : theme.textSecondary }
+            ]}>
+              {new Date(item.timestamp).toLocaleTimeString([], { 
+                hour: '2-digit', 
+                minute: '2-digit' 
+              })}
+            </Text>
+            
+            {isOwn && (
+              <View style={styles.messageStatus}>
+                {item.status === 'sending' && (
+                  <ActivityIndicator size="small" color={theme.textOnPrimary + '80'} />
+                )}
+                {item.status === 'sent' && (
+                  <Icon name="done" size={16} color={theme.textOnPrimary + '80'} />
+                )}
+                {item.status === 'delivered' && (
+                  <Icon name="done-all" size={16} color={theme.textOnPrimary + '80'} />
+                )}
+                {item.status === 'read' && (
+                  <Icon name="done-all" size={16} color="#4FC3F7" />
+                )}
+                {item.status === 'failed' && (
+                  <Icon name="error" size={16} color="#FF5252" />
+                )}
+              </View>
+            )}
+          </View>
+        </View>
+      </View>
     );
   };
 
-  const renderEmptyComponent = () => (
+  // Render empty state
+  const renderEmptyState = () => (
     <View style={styles.emptyContainer}>
-      <Image
-        source={{
-          uri: 'https://cdn.pixabay.com/photo/2021/12/19/19/08/send-6881170_960_720.png',
-        }}
-        style={{ width: 110, height: 110, marginBottom: 12, opacity: 0.8 }}
-        resizeMode="contain"
-      />
-      <Text style={[styles.emptyText, { color: theme.textSecondary }]}>
+      <Icon name="chat" size={80} color={theme.iconSecondary} />
+      <Text style={[styles.emptyText, { color: theme.text }]}>
         No messages yet
       </Text>
       <Text style={[styles.emptySubtext, { color: theme.textSecondary }]}>
-        Start chatting to make a new connection!
+        Start the conversation with {contactProfile?.displayName || contactId}
       </Text>
     </View>
   );
 
-  if (loading && (!messages || messages.length === 0)) {
-    return <LoadingSpinner message="Loading chat..." />;
-  }
+  // Custom header
+  useEffect(() => {
+    navigation.setOptions({
+      header: () => (
+        <SafeAreaView style={[styles.headerContainer, { backgroundColor: theme.primary }]}>
+          <StatusBar backgroundColor={theme.primary} barStyle="light-content" />
+          <View style={styles.header}>
+            <TouchableOpacity
+              style={styles.backButton}
+              onPress={() => navigation.goBack()}
+            >
+              <Icon name="arrow-back" size={24} color={theme.textOnPrimary} />
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={styles.profileSection}
+              onPress={() => {
+                // Navigate to contact profile or show profile modal
+                console.log('Show contact profile');
+              }}
+            >
+              <View style={styles.avatarContainer}>
+                <Image
+                  source={{ 
+                    uri: contactProfile?.photoURL || contactPhoto || 
+                    `https://ui-avatars.com/api/?name=${encodeURIComponent(contactProfile?.displayName || contactId)}&background=random`
+                  }}
+                  style={styles.avatar}
+                />
+                {isOnline && <View style={[styles.onlineIndicator, { backgroundColor: theme.success }]} />}
+              </View>
+              
+              <View style={styles.contactInfo}>
+                <Text style={[styles.contactName, { color: theme.textOnPrimary }]}>
+                  {contactProfile?.displayName || contactName || contactId}
+                </Text>
+                <Text style={[styles.contactStatus, { color: theme.textOnPrimary + '80' }]}>
+                  {isTyping ? 'typing...' : 
+                   isOnline ? 'online' : 
+                   lastSeen ? `last seen ${getTimeAgo(lastSeen)}` : 'offline'}
+                </Text>
+              </View>
+            </TouchableOpacity>
 
-  if (!isAuthenticated) {
+            <View style={styles.headerActions}>
+              <TouchableOpacity style={styles.headerButton}>
+                <Icon name="videocam" size={24} color={theme.textOnPrimary} />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.headerButton}>
+                <Icon name="call" size={24} color={theme.textOnPrimary} />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.headerButton}>
+                <Icon name="more-vert" size={24} color={theme.textOnPrimary} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        </SafeAreaView>
+      ),
+    });
+  }, [contactProfile, isOnline, isTyping, lastSeen, theme]);
+
+  if (!user) {
     return (
-      <SafeAreaView style={[styles.container, { backgroundColor: theme?.chatBackground ?? theme.background }]}>
-        <View style={styles.notAuthContainer}>
-          <Text style={{ color: theme.text, fontSize: 18, margin: 25 }}>
-            Please login to access chats.
+      <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
+        <View style={styles.errorContainer}>
+          <Text style={[styles.errorText, { color: theme.text }]}>
+            Please login to access chat
           </Text>
         </View>
       </SafeAreaView>
@@ -190,97 +528,263 @@ export default function ChatRoomScreen({ navigation }) {
   }
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: theme?.chatBackground ?? theme.background }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={styles.keyboardView}
+        style={styles.container}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
       >
+        {/* Messages List */}
         <FlatList
+          ref={flatListRef}
           data={messages}
           renderItem={renderMessage}
-          keyExtractor={item => item.id}
+          keyExtractor={(item) => item.id}
           style={styles.messagesList}
-          contentContainerStyle={[
-            styles.messagesContent,
-            messages.length === 0 && { flex: 1, justifyContent: 'center', alignItems: 'center' },
-          ]}
+          contentContainerStyle={messages.length === 0 ? { flex: 1 } : { paddingVertical: 16 }}
           inverted={messages.length > 0}
           showsVerticalScrollIndicator={false}
-          refreshing={refreshing}
-          onRefresh={handleRefresh}
-          ListEmptyComponent={renderEmptyComponent}
+          ListEmptyComponent={renderEmptyState}
+          onContentSizeChange={() => {
+            if (messages.length > 0) {
+              flatListRef.current?.scrollToOffset({ offset: 0, animated: true });
+            }
+          }}
         />
-        <ChatInput onSendMessage={handleSendMessage} />
+
+        {/* Typing Indicator */}
+        {isTyping && (
+          <View style={[styles.typingContainer, { backgroundColor: theme.surface }]}>
+            <View style={styles.typingDots}>
+              <View style={[styles.typingDot, { backgroundColor: theme.primary }]} />
+              <View style={[styles.typingDot, { backgroundColor: theme.primary }]} />
+              <View style={[styles.typingDot, { backgroundColor: theme.primary }]} />
+            </View>
+            <Text style={[styles.typingText, { color: theme.textSecondary }]}>
+              {contactProfile?.displayName || contactId} is typing...
+            </Text>
+          </View>
+        )}
+
+        {/* Input Area */}
+        <View style={[styles.inputContainer, { backgroundColor: theme.surface }]}>
+          <View style={[styles.inputRow, { backgroundColor: theme.background }]}>
+            <TouchableOpacity style={styles.attachButton}>
+              <Icon name="attach-file" size={24} color={theme.iconSecondary} />
+            </TouchableOpacity>
+            
+            <TextInput
+              style={[styles.textInput, { color: theme.text }]}
+              value={inputText}
+              onChangeText={handleTextChange}
+              placeholder={`Message ${contactProfile?.displayName || contactId}...`}
+              placeholderTextColor={theme.textSecondary}
+              multiline
+              maxLength={1000}
+              textAlignVertical="center"
+            />
+            
+            <TouchableOpacity
+              style={[
+                styles.sendButton,
+                { backgroundColor: inputText.trim() ? theme.primary : theme.border }
+              ]}
+              onPress={sendMessage}
+              disabled={!inputText.trim() || sending}
+            >
+              {sending ? (
+                <ActivityIndicator size="small" color={theme.textOnPrimary} />
+              ) : (
+                <Icon 
+                  name="send" 
+                  size={20} 
+                  color={inputText.trim() ? theme.textOnPrimary : theme.textSecondary} 
+                />
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  container: {
+    flex: 1,
+  },
+  headerContainer: {
+    elevation: 4,
+    shadowOpacity: 0.1,
+    shadowOffset: { width: 0, height: 2 },
+    shadowRadius: 4,
+  },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingBottom: 13,
-    borderBottomWidth: 0,
-    elevation: 0,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
   },
-  headerBackButton: {
-    marginRight: 2,
-    paddingRight: 4,
-    paddingVertical: 4,
-    alignItems: 'center',
-    justifyContent: 'center',
+  backButton: {
+    marginRight: 12,
   },
-  headerAvatar: {
-    width: AVATAR_SIZE,
-    height: AVATAR_SIZE,
-    borderRadius: AVATAR_SIZE / 2,
-    backgroundColor: '#eee',
-    marginRight: 15,
-  },
-  headerTextContainer: {
+  profileSection: {
     flex: 1,
-    flexDirection: 'column',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  avatarContainer: {
+    position: 'relative',
+    marginRight: 12,
+  },
+  avatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#E0E0E0',
+  },
+  onlineIndicator: {
+    position: 'absolute',
+    bottom: 0,
+    right: 0,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: 'white',
+  },
+  contactInfo: {
+    flex: 1,
+  },
+  contactName: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 2,
+  },
+  contactStatus: {
+    fontSize: 14,
+    fontStyle: 'italic',
+  },
+  headerActions: {
+    flexDirection: 'row',
+  },
+  headerButton: {
+    marginLeft: 16,
+  },
+  messagesList: {
+    flex: 1,
+    paddingHorizontal: 16,
+  },
+  messageContainer: {
+    marginVertical: 2,
+  },
+  timestamp: {
+    textAlign: 'center',
+    fontSize: 12,
+    marginVertical: 8,
+  },
+  messageBubble: {
+    maxWidth: '80%',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 18,
+    marginVertical: 2,
+  },
+  ownMessage: {
+    alignSelf: 'flex-end',
+    borderBottomRightRadius: 4,
+  },
+  otherMessage: {
+    alignSelf: 'flex-start',
+    borderBottomLeftRadius: 4,
+  },
+  messageText: {
+    fontSize: 16,
+    lineHeight: 22,
+  },
+  messageFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    marginTop: 4,
+  },
+  messageTime: {
+    fontSize: 12,
+  },
+  messageStatus: {
+    marginLeft: 4,
+  },
+  typingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  typingDots: {
+    flexDirection: 'row',
+    marginRight: 8,
+  },
+  typingDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    marginHorizontal: 1,
+  },
+  typingText: {
+    fontSize: 14,
+    fontStyle: 'italic',
+  },
+  inputContainer: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    borderRadius: 25,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  attachButton: {
+    marginRight: 12,
+  },
+  textInput: {
+    flex: 1,
+    fontSize: 16,
+    maxHeight: 100,
+    paddingVertical: 8,
+  },
+  sendButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     justifyContent: 'center',
+    alignItems: 'center',
+    marginLeft: 12,
   },
-  headerName: {
-    fontSize: 19,
-    fontWeight: '700',
-    marginBottom: 1,
-    letterSpacing: 0.07,
-  },
-  headerId: {
-    fontSize: 13,
-    fontWeight: '500',
-    letterSpacing: 0.03,
-    marginTop: 0,
-  },
-  keyboardView: { flex: 1 },
-  messagesList: { flex: 1 },
-  messagesContent: { paddingVertical: 16 },
   emptyContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
     flex: 1,
-    paddingTop: 64,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 40,
   },
   emptyText: {
-    fontSize: 18,
-    fontWeight: '700',
-    marginBottom: 5,
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginTop: 16,
+    marginBottom: 8,
   },
   emptySubtext: {
-    fontSize: 14,
-    fontWeight: '400',
+    fontSize: 16,
     textAlign: 'center',
-    opacity: 0.85,
+    lineHeight: 24,
   },
-  notAuthContainer: {
+  errorContainer: {
     flex: 1,
-    alignItems: 'center',
     justifyContent: 'center',
-    height: '100%',
+    alignItems: 'center',
+  },
+  errorText: {
+    fontSize: 18,
   },
 });
